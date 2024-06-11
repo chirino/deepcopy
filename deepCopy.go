@@ -12,7 +12,8 @@ import (
 	"unicode/utf8"
 )
 
-func DeepCopy(input, output interface{}) error {
+func DeepCopy(input, output interface{}, converters ...interface{}) error {
+
 	inputVal := reflect.ValueOf(input)
 	outputVal := reflect.ValueOf(output)
 	if outputVal.Kind() != reflect.Ptr {
@@ -21,11 +22,81 @@ func DeepCopy(input, output interface{}) error {
 	}
 	outputVal = outputVal.Elem()
 	inputVal = smartMaxDereference(inputVal, outputVal)
-	err := smartCopy(inputVal, outputVal)
+
+	converterMap, err := createConverterMap(converters)
+	if err != nil {
+		return err
+	}
+
+	err = smartCopy(inputVal, outputVal, converterMap)
 	if err != nil {
 		return err
 	}
 	return nil
+}
+
+type ConvertKey struct {
+	From reflect.Type
+	To   reflect.Type
+}
+type Converter func(from reflect.Value) (reflect.Value, error)
+
+func createConverterMap(converters []interface{}) (map[ConvertKey]Converter, error) {
+	if len(converters) == 0 {
+		return nil, nil
+	}
+	mapConverters := map[ConvertKey]Converter{}
+	for _, c := range converters {
+		converter := reflect.ValueOf(c)
+		if converter.Kind() != reflect.Func {
+			return nil, fmt.Errorf("expected converter function received %s", converter.Kind())
+		}
+		// how many arguments does the converter function take?
+		numArgs := converter.Type().NumIn()
+		if numArgs != 1 {
+			return nil, fmt.Errorf("expected converter function to accepte only 1 argument, received %d", numArgs)
+		}
+		// what type is the argument?
+		fromType := converter.Type().In(0)
+		// how many return values does the converter function have?
+		numReturns := converter.Type().NumOut()
+		var key ConvertKey
+		var value Converter
+		switch numReturns {
+		case 1:
+			// what type is the return value?
+			toType := converter.Type().Out(0)
+			key = ConvertKey{From: fromType, To: toType}
+			value = func(from reflect.Value) (reflect.Value, error) {
+				// call the converter function
+				return converter.Call([]reflect.Value{from})[0], nil
+			}
+
+		case 2:
+			toType := converter.Type().Out(0)
+			// the second return value should be an error
+			if converter.Type().Out(1) != reflect.TypeOf(errors.New).Out(0) {
+				return nil, fmt.Errorf("expected converter function to return an error as the second value")
+			}
+			key = ConvertKey{From: fromType, To: toType}
+			value = func(from reflect.Value) (reflect.Value, error) {
+				// call the converter function
+				results := converter.Call([]reflect.Value{from})
+				// check if the second return value is an error
+				if !results[1].IsNil() {
+					return results[0], results[1].Interface().(error)
+				}
+				return results[0], nil
+			}
+		default:
+			return nil, fmt.Errorf("expected converter function to return 1 or 2 values, received %d", numReturns)
+		}
+		if _, found := mapConverters[key]; found {
+			return nil, fmt.Errorf("duplicate converter function to map (type %s) to (type %s) found", key.From, key.To)
+		}
+		mapConverters[key] = value
+	}
+	return mapConverters, nil
 }
 
 const (
@@ -38,20 +109,35 @@ var (
 	timestamppbPtrType = reflect.TypeOf(&timestamppb.Timestamp{})
 )
 
-func smartCopy(inValue reflect.Value, outValue reflect.Value) (err error) {
-	errCouldNotConvert := fmt.Errorf("unable to convert %s (type %s) to type %s", inValue.Interface(), inValue.Type(), outValue.Type())
+func smartCopy(inValue reflect.Value, outValue reflect.Value, converterMap map[ConvertKey]Converter) (err error) {
+	errCouldNotConvert := func() error {
+		return fmt.Errorf("unable to convert %v (type %s) to (type %s)", inValue.Interface(), inValue.Type(), outValue.Type())
+	}
 	if !outValue.CanSet() {
 		err := fmt.Errorf("value of %s cannot be set", outValue.Interface())
 		return err
 	}
 	done := false
 
+	// handle custom converters, they override the built-in ones
+	if converterMap != nil {
+		convertKey := ConvertKey{From: inValue.Type(), To: outValue.Type()}
+		if converter, ok := converterMap[convertKey]; ok {
+			newInValue, err := converter(inValue)
+			if err != nil {
+				return fmt.Errorf("unable to convert %v (type %s) to (type %s)", inValue.Interface(), inValue.Type(), outValue.Type(), err)
+			}
+			outValue.Set(newInValue)
+			return nil
+		}
+	}
+
 	// handle string -> number
 	if inValue.Kind() == reflect.String {
 		attempted, noError := parseStringFlexibly(inValue, outValue)
 		if attempted {
 			if !noError {
-				return errCouldNotConvert
+				return errCouldNotConvert()
 			}
 			return
 		}
@@ -75,7 +161,7 @@ func smartCopy(inValue reflect.Value, outValue reflect.Value) (err error) {
 	switch outValue.Kind() {
 	default:
 		if inValue.Type() != outValue.Type() && !CanConvert(inValue, outValue.Type()) {
-			return errCouldNotConvert
+			return errCouldNotConvert()
 		} else {
 			newInValue := inValue.Convert(outValue.Type())
 			outValue.Set(newInValue)
@@ -86,7 +172,7 @@ func smartCopy(inValue reflect.Value, outValue reflect.Value) (err error) {
 		done = true
 	case reflect.Slice:
 		if inValue.Kind() != reflect.Slice {
-			return errCouldNotConvert
+			return errCouldNotConvert()
 		}
 		sliceType := reflect.TypeOf(outValue.Interface())
 		newOutValue := reflect.MakeSlice(sliceType, inValue.Len(), inValue.Len())
@@ -94,7 +180,7 @@ func smartCopy(inValue reflect.Value, outValue reflect.Value) (err error) {
 			inVal := inValue.Index(i)
 			outVal := reflect.New(sliceType.Elem()).Elem()
 			inVal = smartMaxDereference(inVal, outVal)
-			err := smartCopy(inVal, outVal)
+			err := smartCopy(inVal, outVal, converterMap)
 			if err != nil {
 				return err
 			}
@@ -105,13 +191,13 @@ func smartCopy(inValue reflect.Value, outValue reflect.Value) (err error) {
 	case reflect.Ptr:
 		outValueInterfaceTypeOfElem := reflect.TypeOf(outValue.Interface()).Elem()
 		childOutVal := reflect.New(reflect.TypeOf(inValue.Interface()))
-		err := smartCopy(inValue, childOutVal.Elem())
+		err := smartCopy(inValue, childOutVal.Elem(), converterMap)
 		if err != nil {
 			return err
 		}
 		childOutValOut := reflect.New(outValueInterfaceTypeOfElem)
 		childOutValElemNonPtr := smartMaxDereference(childOutVal.Elem(), childOutValOut.Elem())
-		err = smartCopy(childOutValElemNonPtr, childOutValOut.Elem())
+		err = smartCopy(childOutValElemNonPtr, childOutValOut.Elem(), converterMap)
 		if err != nil {
 			return err
 		}
@@ -128,7 +214,7 @@ func smartCopy(inValue reflect.Value, outValue reflect.Value) (err error) {
 			}
 			startingCount = inValue.NumField()
 		} else if inValue.Kind() != reflect.Struct {
-			return errCouldNotConvert
+			return errCouldNotConvert()
 		}
 
 		inValNumField := inValue.NumField()
@@ -160,15 +246,15 @@ func smartCopy(inValue reflect.Value, outValue reflect.Value) (err error) {
 
 				if fieldsMatch(reflect.TypeOf(inValue.Interface()).Field(i), reflect.TypeOf(outValue.Interface()).Field(j)) {
 					if !inputField.IsValid() {
-						err = errors.New(errCouldNotConvert.Error() + fmt.Sprintf(": field %s is invalid", inputFieldName))
+						err = errors.New(errCouldNotConvert().Error() + fmt.Sprintf(": field %s is invalid", inputFieldName))
 						return err
 					}
 					if !outputField.CanSet() {
-						err = errors.New(errCouldNotConvert.Error() + fmt.Sprintf(": cannot set field %s", outputFieldName))
+						err = errors.New(errCouldNotConvert().Error() + fmt.Sprintf(": cannot set field %s", outputFieldName))
 						return err
 					}
 					inputField = smartMaxDereference(inputField, outputField)
-					err = smartCopy(inputField, outputField)
+					err = smartCopy(inputField, outputField, converterMap)
 					if err != nil {
 						return err
 					}
@@ -179,7 +265,7 @@ func smartCopy(inValue reflect.Value, outValue reflect.Value) (err error) {
 		done = true
 	}
 	if !done {
-		return errCouldNotConvert
+		return errCouldNotConvert()
 	}
 	return
 }

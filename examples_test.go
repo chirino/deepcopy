@@ -1,6 +1,8 @@
 package deepcopy
 
 import (
+	"encoding/hex"
+	"fmt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -215,4 +217,37 @@ func TestDeepCopyExamples(t *testing.T) {
 			}
 		})
 	}
+}
+
+type Hex string
+type ExampleA struct {
+	Data string
+}
+type ExampleB struct {
+	Data Hex
+}
+
+func StringToHex(data string) Hex {
+	return Hex(hex.EncodeToString([]byte(data)))
+}
+
+func HexToString(data Hex) (string, error) {
+	hex, err := hex.DecodeString(string(data))
+	if err != nil {
+		return "", err
+	}
+	return string(hex), nil
+}
+
+func TestConvertExample(t *testing.T) {
+	objA := ExampleA{
+		Data: "Hello",
+	}
+	objB := ExampleB{}
+
+	_ = DeepCopy(objA, &objB, StringToHex)
+	fmt.Println(objB.Data) // "48656c6c6f"
+	objB.Data = "576f726c64"
+	_ = DeepCopy(objB, &objA, HexToString)
+	fmt.Println(objA.Data) // "World"
 }

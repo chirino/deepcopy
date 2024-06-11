@@ -22,6 +22,7 @@ directed field matching.
     * [Case 1: Struct Conversion](#case-1-struct-conversion)
     * [Case 2: Identical Copy](#case-2-identical-copy)
     * [Case 3: General Type Casting](#case-3-general-type-casting)
+    * [Case 4: Custom Converters](#case-3-custom-converters)
 * [What Gets Copied?](#what-exactly-gets-copied?)
 * Examples
     * [Basic Example](#basic-example)
@@ -120,6 +121,45 @@ will be copied over to the matching field in ```objB```.
 
 Additionally, all existing fields in ```objB``` that are ***not
 overwritten*** by ```objA``` will remain in ```objB```.
+
+### Case 4: Custom Converters
+
+If there are type conversions that DeepCopy does not handle, or which you would like to handle differently, you can define custom converters.  The converter functions must have the following signature:
+
+`func(value SourceType) TargetType` or `func(value SourceType) (TargetType, error)`
+
+The DeepCopy can accept any number of custom converters as arguments.  It is an error to supply a duplicate converter for the same types.
+
+```go
+type Hex string
+type ExampleA struct {
+	Data string
+}
+type ExampleB struct {
+	Data Hex
+}
+func StringToHex(data string) Hex {
+	return Hex(hex.EncodeToString([]byte(data)))
+}
+func HexToString(data Hex) (string, error) {
+	hex, err := hex.DecodeString(string(data))
+	if err != nil {
+		return "", err
+	}
+	return string(hex), nil
+}
+
+objA := ExampleA{
+	Data: "Hello",
+}
+objB := ExampleB{}
+  
+deepcopy.DeepCopy(objA, &objB, StringToHex, HexToString)
+fmt.Println(objB.Data) // "48656c6c6f"
+objB.Data = "576f726c64"
+deepcopy.DeepCopy(objB, &objA, StringToHex, HexToString)
+fmt.Println(objA.Data) // "World"
+```
 
 ### Matching Fields
 Fields are considered matching if they have the same name (case-insensitive)

@@ -164,6 +164,7 @@ func TestDeepCopy(t *testing.T) {
 		outputPtr       interface{}
 		expectedRespPtr interface{}
 		expectedErr     error
+		converters      []interface{}
 	}{
 		{
 			name: "bad conversion to timestamp",
@@ -172,6 +173,21 @@ func TestDeepCopy(t *testing.T) {
 			},
 			outputPtr:   &NewStruct2{},
 			expectedErr: errors.New("unable to convert %!s(int32=12) (type int32) to type timestamppb.Timestamp"),
+		},
+		{
+			name: "fix bad conversion to timestamp error with a converter",
+			input: NewStruct1{
+				BadConversion1: int32(12),
+			},
+			outputPtr: &NewStruct2{},
+			converters: []interface{}{
+				func(when int32) timestamppb.Timestamp {
+					return *timestamppb.New(time.Unix(int64(when), 0))
+				},
+			},
+			expectedRespPtr: &NewStruct2{
+				BadConversion1: *timestamppb.New(time.Unix(int64(12), 0)),
+			},
 		},
 		{
 			name: "input val has unexported field",
@@ -238,6 +254,38 @@ func TestDeepCopy(t *testing.T) {
 			},
 			outputPtr:   &NewStruct2{},
 			expectedErr: errors.New("unable to convert pickup (type deepcopy.LocalInspectionType) to type deepcopy.InspectionType"),
+		},
+		{
+			name: "fix enum with no match, fixed with converter",
+			input: NewStruct1{
+				Enum: LocalInspectionType_Pickup,
+			},
+			outputPtr: &NewStruct2{},
+			converters: []interface{}{
+				func(x LocalInspectionType) (InspectionType, error) {
+					switch x {
+					case LocalInspectionType_Pickup:
+						return InspectionType(1), nil
+					}
+					return InspectionType(0), errors.New("no match")
+				},
+			},
+			expectedRespPtr: &NewStruct2{
+				Enum: InspectionType(1),
+			},
+		},
+		{
+			name: "enum with no match with converter error fails",
+			input: NewStruct1{
+				Enum: LocalInspectionType_Pickup,
+			},
+			outputPtr: &NewStruct2{},
+			converters: []interface{}{
+				func(x LocalInspectionType) (InspectionType, error) {
+					return InspectionType(0), errors.New("forced failure")
+				},
+			},
+			expectedErr: errors.New("unable to convert pickup (type deepcopy.LocalInspectionType) to type deepcopy.InspectionType: forced failure"),
 		},
 		{
 			name:        "non-pointer outputType, should fail",
@@ -494,7 +542,7 @@ func TestDeepCopy(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := DeepCopy(tc.input, tc.outputPtr)
+			err := DeepCopy(tc.input, tc.outputPtr, tc.converters...)
 			if tc.expectedErr != nil {
 				require.Error(t, err)
 				assert.Equal(t, tc.expectedErr.Error(), err.Error())
